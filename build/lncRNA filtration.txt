@@ -1,0 +1,95 @@
+########## Quality check
+fastqc "sample"
+
+######### Sample to ".sam" format
+hisat2 grch/genome -1 "first_read" -2 "second_read" -S sample.sam  
+
+######## Quality check of ".sam" file 
+samtools flagstat "sample.sam"
+
+####### ".sam" to ".bam"
+samtools view -bS "sample.sam" > "sample.bam" 
+
+######## Quality check of ".bam" file 
+samtools flagstat "sample.sam"
+
+####### ".sam" to "_sorted.bam"
+samtools view -bS "sample.sam" | samtools sort -o "sample_sorted.bam" 
+
+######## Quality check of "_sorted.bam" file ##########We can do this step also directly without doing the ".bam" we can directly go "_sorted.bam"
+samtools flagstat "sample.sam"
+
+######## Assembly using "stringtie"
+Stringtie "sample_soted.bam" -g Homo_sapiens.GRCh38.113.gtf -o "sample.gtf"
+
+########  for a list.txt file for merging all the stringtie assembled transcripts of all samples 
+ls *.gtf > mergelist.txt
+
+######## merge all the assembled transcripts samples
+Stringtie --merge -p 8 -g Homo_sapiens.GRCh38.113.gtf -o merged.gtf mergelist.txt
+
+####################################################
+####################################################
+#########                                ###########
+######### FILTRATION FOR lncRNA ANALYSIS ###########
+#########                                ###########
+####################################################
+####################################################
+
+########### Compare with merged file 
+gffcompare -r Homo_sapiens.GRCh38.113.gtf -G -o gffcomp_out merged.gtf
+
+###########check the class code is present or not 
+grep -E 'class_code "i"|class_code "u"|class_code "x"|class_code "o"|class_code "k"' gffcomp_out.annotated.gtf | less
+
+########## Take only the class code of "i", "u", "x", "o", "k"
+grep -E 'class_code "i"|class_code "u"|class_code "x"|class_code "o"|class_code "k"' gffcomp_out.annotated.gtf > merge_sk_ann.gtf
+
+######## Filter based on length
+awk '$3 == "transcript" {if ($5 - $4 + 1 >= 200) print $0}' merge_sk_ann.gtf > merge_sk_ann_length.gtf
+
+########## Now Annotate with reference gtf file 
+gffread merge_sk_ann_length.gtf -g Homo_sapiens.GRCh38.dna.toplevel.fa -w merge_sk_ann.fa
+
+###### Analysis of ORF using 	Transdecoder
+TransDecoder.LongOrfs -t merge_sk_ann.fa
+
+###### Predict the ORF file using Transdecoder 
+TransDecoder.Predict -t merge_sk_ann.fa
+
+####### Filter out coding transcripts
+grep ">" merge_sk_ann.fa.transdecoder.cds | cut -d " " -f1 | sed 's/>//' | sed 's/\.p[0-9]\+$//' | sort | uniq > transdecoder_coding_ids.txt
+
+######### Now remove those from the original FASTA:
+seqkit grep -v -f transdecoder_coding_ids.txt merge_sk_ann.fa > merge_sk_ann_noORF.fa
+
+cpat.py -g merge_sk_ann_noORF.fa -d Human_logitModel.RData -x Human_Hexamer.tsv -o cpat_output.txt
+python /home/mth19/miniconda3/envs/plek_env/bin/PLEK.py -fasta merge_sk_ann_noORF.fa -out plek_output.txt
+python CPC2.py -i merge_sk_ann_noORF.fa -o cpc2_output.txt
+
+awk 'NR>1 && $5 < 0.364 {print $1}' cpat_output.txt > noncoding_cpat.txt
+awk 'NR>1 && $8 == "noncoding" {print $1}' cpc2_output.txt > noncoding_cpc2.txt
+awk '$1 == "Non-coding" {gsub(/^>/, "", $3); print $3}' plek_output.txt > noncoding_plek.txt
+cat noncoding_plek.txt noncoding_cpat.txt noncoding_cpc2.txt > combined_noncoding_clean.txt
+sort combined_noncoding_clean.txt | uniq > final_noncoding.txt
+
+####### To get fasta sequence for only those ids which are needed
+seqkit grep -f final_noncoding.txt merge_sk_ann_noORF.fa > final_noncoding_sequences.fa
+
+######### BLASTX Against UniProt (Remove Protein-Coding Transcripts)
+######### Download the UniProt Database
+wget ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
+gunzip uniprot_sprot.fasta.gz
+
+####### Format the Database for BLAST
+makeblastdb -in uniprot_sprot.fasta -dbtype prot -out uniprot_db
+
+###### Run BLASTX Against UniProt
+###########Run BLASTX on your CPC2-filtered transcripts:
+
+blastx -query non_coding_lncRNAs.fa -db uniprot_sprot.fasta -out blastx_output.txt -evalue 1e-5 -outfmt 6 -max_target_seqs 1 -max_hsps 1 -num_threads 12 
+       
+######## Remove Protein-Matching Transcripts
+########### Extract IDs of transcripts that matched proteins:
+cut -f1 blastx_output.txt | sort | uniq > matched_to_uniprot.txt
+seqkit grep -v -f matched_to_uniprot.txt final_noncoding_sequences.fa > final_noncoding_no_uniprot.fa
